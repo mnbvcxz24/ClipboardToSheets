@@ -9,7 +9,6 @@ from tkinter import messagebox
 import gspread
 import pyperclip
 from google.oauth2.service_account import Credentials
-from plyer import notification
 
 APP_NAME = "ClipboardToSheets"
 BASE_DIR = Path(__file__).resolve().parent
@@ -57,11 +56,20 @@ class ClipboardToSheetsApp:
         )
         self.status_label.pack(pady=(0, 12))
 
-        self.state_label = tk.Label(
-            root, text="LOGGING OFF", bg=PANEL, fg=MUTED,
-            font=("Segoe UI", 11, "bold"), width=22, pady=9
+        state_frame = tk.Frame(root, bg=PANEL)
+        state_frame.pack(pady=4)
+
+        self.state_dot = tk.Label(
+            state_frame, text="●", bg=PANEL, fg=MUTED,
+            font=("Segoe UI", 13, "bold")
         )
-        self.state_label.pack(pady=4)
+        self.state_dot.pack(side="left", padx=(14, 7), pady=9)
+
+        self.state_label = tk.Label(
+            state_frame, text="LOGGING OFF", bg=PANEL, fg=MUTED,
+            font=("Segoe UI", 11, "bold"), width=20, pady=9
+        )
+        self.state_label.pack(side="left", padx=(0, 14))
 
         buttons = tk.Frame(root, bg=BG)
         buttons.pack(pady=12)
@@ -92,22 +100,10 @@ class ClipboardToSheetsApp:
         self.root.after(150, self.process_events)
         self.connect_async()
 
-    def notify(self, title, message):
-        try:
-            notification.notify(
-                title=title,
-                message=message,
-                app_name=APP_NAME,
-                timeout=4
-            )
-        except Exception:
-            pass
-
     def connect_async(self):
         if not CREDENTIALS_FILE.is_file():
             self.set_status("credentials.json not found", RED)
             self.activity_label.config(text="Place credentials.json beside the app.")
-            self.notify(APP_NAME, "credentials.json was not found.")
             return
 
         self.connect_button.config(state="disabled", text="Connecting...")
@@ -152,20 +148,20 @@ class ClipboardToSheetsApp:
                         threading.Thread(
                             target=self.clipboard_watch_loop, daemon=True
                         ).start()
-                    self.notify(APP_NAME, "Connected to Google Sheets.")
                 elif event == "connect_error":
                     self.connected = False
+                    self.logging_enabled.clear()
+                    self.state_dot.config(fg=MUTED)
+                    self.state_label.config(text="LOGGING OFF", fg=MUTED)
+                    self.toggle_button.config(text="Turn ON", bg=GREEN, fg="#06210f")
                     self.connect_button.config(state="normal", text="Reconnect")
                     self.toggle_button.config(state="disabled")
                     self.set_status("Connection failed", RED)
                     self.activity_label.config(text=payload[:160])
-                    self.notify(APP_NAME, "Could not connect to Google Sheets. Check app status.")
                 elif event == "logged":
                     self.activity_label.config(text=f"Logged copied text to {payload}")
-                    self.notify(APP_NAME, f"Copied text logged to {payload}.")
                 elif event == "log_error":
                     self.activity_label.config(text="Could not write to Google Sheets.")
-                    self.notify(APP_NAME, "Could not write to Google Sheets. Check your connection.")
         except queue.Empty:
             pass
         if not self.stop_event.is_set():
@@ -173,20 +169,20 @@ class ClipboardToSheetsApp:
 
     def toggle_logging(self):
         if not self.connected:
-            self.notify(APP_NAME, "Connect to Google Sheets first.")
+            self.activity_label.config(text="Connect to Google Sheets first.")
             return
         if self.logging_enabled.is_set():
             self.logging_enabled.clear()
             self.toggle_button.config(text="Turn ON", bg=GREEN, fg="#06210f")
             self.state_label.config(text="LOGGING OFF", fg=MUTED)
+            self.state_dot.config(fg=MUTED)
             self.set_status("Connected · logging paused", MUTED)
-            self.notify(APP_NAME, "Clipboard logging is OFF.")
         else:
             self.logging_enabled.set()
             self.toggle_button.config(text="Turn OFF", bg=RED, fg="white")
             self.state_label.config(text="LOGGING ON", fg=GREEN)
+            self.state_dot.config(fg=GREEN)
             self.set_status("Connected · watching clipboard", GREEN)
-            self.notify(APP_NAME, "Clipboard logging is ON.")
 
     def get_next_position(self):
         col_a = self.sheet.col_values(1)
