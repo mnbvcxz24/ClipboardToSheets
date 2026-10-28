@@ -16,7 +16,7 @@ Run `RUN.bat`. It checks and installs the Python packages, then opens ClipboardT
 - Click **Turn ON** to log new clipboard text to Google Sheets.
 - Click **Turn OFF** to pause logging.
 - Click **Reconnect** if the connection fails.
-- Desktop notifications report connection status, toggles, successful writes, and write errors.
+- The status dot is green while clipboard logging is ON and gray while it is OFF.
 - Values are written in a zigzag pattern: A1, B1, A2, B2, and so on. No timestamps are written to the sheet.
 
 ## Important
