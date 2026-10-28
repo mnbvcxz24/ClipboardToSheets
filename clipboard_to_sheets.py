@@ -1,4 +1,3 @@
-import datetime
 import queue
 import threading
 import time
@@ -8,7 +7,9 @@ from tkinter import messagebox
 
 import gspread
 import pyperclip
+import pystray
 from google.oauth2.service_account import Credentials
+from PIL import Image, ImageDraw
 
 APP_NAME = "ClipboardToSheets"
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,7 +38,7 @@ class ClipboardToSheetsApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("390x270")
+        self.root.geometry("390x250")
         self.root.resizable(False, False)
         self.root.configure(bg=BG)
 
@@ -47,29 +48,25 @@ class ClipboardToSheetsApp:
         self.sheet = None
         self.watcher_started = False
         self.connected = False
+        self.tray_icon = None
+        self.exiting = False
 
-        tk.Label(root, text=APP_NAME, bg=BG, fg=TEXT,
-                 font=("Segoe UI", 17, "bold")).pack(pady=(18, 4))
+        tk.Label(
+            root, text=APP_NAME, bg=BG, fg=TEXT,
+            font=("Segoe UI", 17, "bold")
+        ).pack(pady=(18, 4))
+
         self.status_label = tk.Label(
             root, text="Connecting to Google Sheets...", bg=BG,
             fg=MUTED, font=("Segoe UI", 10)
         )
         self.status_label.pack(pady=(0, 12))
 
-        state_frame = tk.Frame(root, bg=PANEL)
-        state_frame.pack(pady=4)
-
-        self.state_dot = tk.Label(
-            state_frame, text="●", bg=PANEL, fg=MUTED,
-            font=("Segoe UI", 13, "bold")
-        )
-        self.state_dot.pack(side="left", padx=(14, 7), pady=9)
-
         self.state_label = tk.Label(
-            state_frame, text="LOGGING OFF", bg=PANEL, fg=MUTED,
-            font=("Segoe UI", 11, "bold"), width=20, pady=9
+            root, text="●  LOGGING OFF", bg=PANEL, fg=MUTED,
+            font=("Segoe UI", 11, "bold"), width=25, pady=9
         )
-        self.state_label.pack(side="left", padx=(0, 14))
+        self.state_label.pack(pady=4)
 
         buttons = tk.Frame(root, bg=BG)
         buttons.pack(pady=12)
@@ -96,9 +93,66 @@ class ClipboardToSheetsApp:
         )
         self.activity_label.pack(pady=(1, 0))
 
-        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.after(150, self.process_events)
+        self.start_tray_icon()
         self.connect_async()
+
+    @staticmethod
+    def make_tray_image(is_on):
+        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        color = (34, 197, 94, 255) if is_on else (156, 163, 175, 255)
+        draw.ellipse((8, 8, 56, 56), fill=color)
+        draw.ellipse((17, 17, 47, 47), fill=(255, 255, 255, 45))
+        return image
+
+    def start_tray_icon(self):
+        menu = pystray.Menu(
+            pystray.MenuItem("Open ClipboardToSheets", self.tray_show),
+            pystray.MenuItem(
+                lambda item: "Turn OFF logging" if self.logging_enabled.is_set()
+                else "Turn ON logging",
+                self.tray_toggle,
+                enabled=lambda item: self.connected
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", self.tray_exit)
+        )
+        self.tray_icon = pystray.Icon(
+            APP_NAME, self.make_tray_image(False), APP_NAME, menu
+        )
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def refresh_tray_icon(self):
+        if self.tray_icon is not None:
+            is_on = self.logging_enabled.is_set()
+            self.tray_icon.icon = self.make_tray_image(is_on)
+            self.tray_icon.title = (
+                f"{APP_NAME} - Logging ON" if is_on
+                else f"{APP_NAME} - Logging OFF"
+            )
+            self.tray_icon.update_menu()
+
+    def tray_show(self, icon=None, item=None):
+        self.root.after(0, self.show_window)
+
+    def tray_toggle(self, icon=None, item=None):
+        self.root.after(0, self.toggle_logging)
+
+    def tray_exit(self, icon=None, item=None):
+        self.root.after(0, self.exit_app)
+
+    def show_window(self):
+        if self.exiting:
+            return
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def hide_window(self):
+        if not self.exiting:
+            self.root.withdraw()
 
     def connect_async(self):
         if not CREDENTIALS_FILE.is_file():
@@ -148,16 +202,17 @@ class ClipboardToSheetsApp:
                         threading.Thread(
                             target=self.clipboard_watch_loop, daemon=True
                         ).start()
+                    self.refresh_tray_icon()
                 elif event == "connect_error":
                     self.connected = False
                     self.logging_enabled.clear()
-                    self.state_dot.config(fg=MUTED)
-                    self.state_label.config(text="LOGGING OFF", fg=MUTED)
+                    self.state_label.config(text="●  LOGGING OFF", fg=MUTED)
                     self.toggle_button.config(text="Turn ON", bg=GREEN, fg="#06210f")
                     self.connect_button.config(state="normal", text="Reconnect")
                     self.toggle_button.config(state="disabled")
                     self.set_status("Connection failed", RED)
                     self.activity_label.config(text=payload[:160])
+                    self.refresh_tray_icon()
                 elif event == "logged":
                     self.activity_label.config(text=f"Logged copied text to {payload}")
                 elif event == "log_error":
@@ -174,15 +229,14 @@ class ClipboardToSheetsApp:
         if self.logging_enabled.is_set():
             self.logging_enabled.clear()
             self.toggle_button.config(text="Turn ON", bg=GREEN, fg="#06210f")
-            self.state_label.config(text="LOGGING OFF", fg=MUTED)
-            self.state_dot.config(fg=MUTED)
+            self.state_label.config(text="●  LOGGING OFF", fg=MUTED)
             self.set_status("Connected · logging paused", MUTED)
         else:
             self.logging_enabled.set()
             self.toggle_button.config(text="Turn OFF", bg=RED, fg="white")
-            self.state_label.config(text="LOGGING ON", fg=GREEN)
-            self.state_dot.config(fg=GREEN)
+            self.state_label.config(text="●  LOGGING ON", fg=GREEN)
             self.set_status("Connected · watching clipboard", GREEN)
+        self.refresh_tray_icon()
 
     def get_next_position(self):
         col_a = self.sheet.col_values(1)
@@ -219,10 +273,16 @@ class ClipboardToSheetsApp:
                     self.events.put(("log_error", None))
             time.sleep(POLL_INTERVAL_SECONDS)
 
-    def close_app(self):
-        if messagebox.askyesno(APP_NAME, "Exit ClipboardToSheets?"):
-            self.stop_event.set()
-            self.root.destroy()
+    def exit_app(self):
+        if self.exiting:
+            return
+        if not messagebox.askyesno(APP_NAME, "Exit ClipboardToSheets?"):
+            return
+        self.exiting = True
+        self.stop_event.set()
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+        self.root.destroy()
 
 
 def main():
