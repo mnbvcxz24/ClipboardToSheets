@@ -1,4 +1,3 @@
 pyperclip
 gspread
 google-auth
-plyer
