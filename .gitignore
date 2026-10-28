@@ -1,0 +1,13 @@
+# Google service account credentials - never commit this
+credentials.json
+secret.py
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
