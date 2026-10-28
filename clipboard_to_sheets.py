@@ -3,7 +3,6 @@ import queue
 import threading
 import time
 import tkinter as tk
-import secret
 from pathlib import Path
 from tkinter import messagebox
 
@@ -14,9 +13,15 @@ from plyer import notification
 
 APP_NAME = "ClipboardToSheets"
 BASE_DIR = Path(__file__).resolve().parent
-CREDENTIALS_FILE = "credentials.json"
-SPREADSHEET_KEY = secret.SPREADSHEET_KEY
-SPREADSHEET_NAME = ""
+CREDENTIALS_FILE = BASE_DIR / "credentials.json"
+
+try:
+    import secret
+except ImportError:
+    secret = None
+
+SPREADSHEET_KEY = getattr(secret, "SPREADSHEET_KEY", "")
+SPREADSHEET_NAME = getattr(secret, "SPREADSHEET_NAME", "Clipboard Log")
 WORKSHEET_NAME = "RAW"
 POLL_INTERVAL_SECONDS = 1
 
@@ -99,7 +104,7 @@ class ClipboardToSheetsApp:
             pass
 
     def connect_async(self):
-        if not CREDENTIALS_FILE.exists():
+        if not CREDENTIALS_FILE.is_file():
             self.set_status("credentials.json not found", RED)
             self.activity_label.config(text="Place credentials.json beside the app.")
             self.notify(APP_NAME, "credentials.json was not found.")
