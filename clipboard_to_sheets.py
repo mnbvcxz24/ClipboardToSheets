@@ -231,6 +231,24 @@ class ClipboardToSheetsApp:
                     self.set_status("Connection failed", RED)
                     self.activity_label.config(text=payload[:160])
                     self.refresh_tray_icon()
+                elif event == "rescanned":
+                    self.next_entry_number = payload
+                    self.logging_enabled.set()
+                    self.toggle_button.config(
+                        state="normal", text="Turn OFF", bg=RED, fg="white"
+                    )
+                    self.state_label.config(text="●  LOGGING ON", fg=GREEN)
+                    self.set_status("Sheet rescanned · watching clipboard", GREEN)
+                    self.activity_label.config(
+                        text=f"Next target: {'A' if payload % 2 == 1 else 'B'}{(payload + 1) // 2}"
+                    )
+                    self.refresh_tray_icon()
+                elif event == "rescan_error":
+                    self.toggle_button.config(
+                        state="normal", text="Turn ON", bg=GREEN, fg="#06210f"
+                    )
+                    self.set_status("Rescan failed · logging remains OFF", RED)
+                    self.activity_label.config(text=str(payload)[:160])
                 elif event == "logged":
                     count, last_cell = payload
                     self.activity_label.config(
@@ -255,11 +273,28 @@ class ClipboardToSheetsApp:
             self.state_label.config(text="●  LOGGING OFF", fg=MUTED)
             self.set_status("Connected · logging paused", MUTED)
         else:
-            self.logging_enabled.set()
-            self.toggle_button.config(text="Turn OFF", bg=RED, fg="white")
-            self.state_label.config(text="●  LOGGING ON", fg=GREEN)
-            self.set_status("Connected · watching clipboard", GREEN)
+            # Keep monitoring paused until pending writes finish and the sheet
+            # has been rescanned, so the next cell is based on current contents.
+            self.toggle_button.config(state="disabled", text="Rescanning...")
+            self.set_status("Rescanning Google Sheets...", MUTED)
+            self.activity_label.config(text="Finishing pending writes first...")
+            threading.Thread(target=self.refresh_position_worker, daemon=True).start()
         self.refresh_tray_icon()
+
+    def refresh_position_worker(self):
+        try:
+            # Wait for queued writes to finish before reading the sheet.
+            self.write_queue.join()
+            values = self.sheet.get_all_values()
+            col_a_count = sum(
+                1 for row in values if len(row) > 0 and row[0].strip()
+            )
+            col_b_count = sum(
+                1 for row in values if len(row) > 1 and row[1].strip()
+            )
+            self.events.put(("rescanned", col_a_count + col_b_count + 1))
+        except Exception as exc:
+            self.events.put(("rescan_error", str(exc)))
 
     def clipboard_watch_loop(self):
         try:
@@ -281,7 +316,8 @@ class ClipboardToSheetsApp:
             if current_value != last_value and current_value.strip():
                 last_value = current_value
                 # Never wait for a Sheets network request in the clipboard watcher.
-                self.write_queue.put(current_value)
+                if self.logging_enabled.is_set():
+                    self.write_queue.put(current_value)
 
             time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -326,6 +362,9 @@ class ClipboardToSheetsApp:
                     self.events.put(("logged", (len(batch_values), last_cell)))
                 except Exception:
                     self.events.put(("log_error", None))
+                finally:
+                    for _ in batch_values:
+                        self.write_queue.task_done()
 
     def exit_app(self):
         if self.exiting:
