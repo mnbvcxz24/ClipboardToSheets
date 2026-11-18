@@ -23,7 +23,11 @@ except ImportError:
 SPREADSHEET_KEY = getattr(secret, "SPREADSHEET_KEY", "")
 SPREADSHEET_NAME = getattr(secret, "SPREADSHEET_NAME", "Clipboard Log")
 WORKSHEET_NAME = "RAW"
-POLL_INTERVAL_SECONDS = 1
+
+# Fast local polling; Google Sheets writes happen on a separate worker.
+POLL_INTERVAL_SECONDS = 0.15
+WRITE_BATCH_WINDOW_SECONDS = 0.12
+MAX_BATCH_SIZE = 50
 
 BG = "#111827"
 PANEL = "#1f2937"
@@ -43,10 +47,13 @@ class ClipboardToSheetsApp:
         self.root.configure(bg=BG)
 
         self.events = queue.Queue()
+        self.write_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.logging_enabled = threading.Event()
         self.sheet = None
+        self.next_entry_number = 1
         self.watcher_started = False
+        self.writer_started = False
         self.connected = False
         self.tray_icon = None
         self.exiting = False
@@ -179,7 +186,13 @@ class ClipboardToSheetsApp:
             else:
                 spreadsheet = client.open(SPREADSHEET_NAME)
             sheet = spreadsheet.worksheet(WORKSHEET_NAME)
-            self.events.put(("connected", sheet))
+
+            # One read on connection to determine the next zigzag cell.
+            values = sheet.get_all_values()
+            col_a_count = sum(1 for row in values if len(row) > 0 and row[0].strip())
+            col_b_count = sum(1 for row in values if len(row) > 1 and row[1].strip())
+            next_entry_number = col_a_count + col_b_count + 1
+            self.events.put(("connected", (sheet, next_entry_number)))
         except Exception as exc:
             self.events.put(("connect_error", str(exc)))
 
@@ -191,7 +204,7 @@ class ClipboardToSheetsApp:
             while True:
                 event, payload = self.events.get_nowait()
                 if event == "connected":
-                    self.sheet = payload
+                    self.sheet, self.next_entry_number = payload
                     self.connected = True
                     self.connect_button.config(state="normal", text="Reconnect")
                     self.toggle_button.config(state="normal")
@@ -201,6 +214,11 @@ class ClipboardToSheetsApp:
                         self.watcher_started = True
                         threading.Thread(
                             target=self.clipboard_watch_loop, daemon=True
+                        ).start()
+                    if not self.writer_started:
+                        self.writer_started = True
+                        threading.Thread(
+                            target=self.sheet_writer_loop, daemon=True
                         ).start()
                     self.refresh_tray_icon()
                 elif event == "connect_error":
@@ -214,9 +232,14 @@ class ClipboardToSheetsApp:
                     self.activity_label.config(text=payload[:160])
                     self.refresh_tray_icon()
                 elif event == "logged":
-                    self.activity_label.config(text=f"Logged copied text to {payload}")
+                    count, last_cell = payload
+                    self.activity_label.config(
+                        text=f"Logged {count} item(s) · latest: {last_cell}"
+                    )
                 elif event == "log_error":
-                    self.activity_label.config(text="Could not write to Google Sheets.")
+                    self.activity_label.config(
+                        text="Could not write to Google Sheets. Will keep monitoring."
+                    )
         except queue.Empty:
             pass
         if not self.stop_event.is_set():
@@ -238,14 +261,6 @@ class ClipboardToSheetsApp:
             self.set_status("Connected · watching clipboard", GREEN)
         self.refresh_tray_icon()
 
-    def get_next_position(self):
-        col_a = self.sheet.col_values(1)
-        col_b = self.sheet.col_values(2)
-        entry_number = len(col_a) + len(col_b) + 1
-        row = (entry_number + 1) // 2
-        col = 1 if entry_number % 2 == 1 else 2
-        return row, col
-
     def clipboard_watch_loop(self):
         try:
             last_value = pyperclip.paste()
@@ -256,6 +271,7 @@ class ClipboardToSheetsApp:
             if not self.logging_enabled.is_set():
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
+
             try:
                 current_value = pyperclip.paste()
             except Exception:
@@ -264,14 +280,52 @@ class ClipboardToSheetsApp:
 
             if current_value != last_value and current_value.strip():
                 last_value = current_value
+                # Never wait for a Sheets network request in the clipboard watcher.
+                self.write_queue.put(current_value)
+
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    def sheet_writer_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                first_value = self.write_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            batch_values = [first_value]
+            deadline = time.monotonic() + WRITE_BATCH_WINDOW_SECONDS
+            while len(batch_values) < MAX_BATCH_SIZE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    row, col = self.get_next_position()
-                    self.sheet.update_cell(row, col, current_value)
-                    cell_ref = f"{'A' if col == 1 else 'B'}{row}"
-                    self.events.put(("logged", cell_ref))
+                    batch_values.append(self.write_queue.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            updates = []
+            last_cell = ""
+            for value in batch_values:
+                entry = self.next_entry_number
+                row = (entry + 1) // 2
+                col = 1 if entry % 2 == 1 else 2
+                last_cell = f"{'A' if col == 1 else 'B'}{row}"
+                updates.append({"range": last_cell, "values": [[value]]})
+                self.next_entry_number += 1
+
+            # A single Sheets API request can write multiple copied values.
+            try:
+                self.sheet.batch_update(updates, value_input_option="RAW")
+                self.events.put(("logged", (len(batch_values), last_cell)))
+            except Exception:
+                # Retry the same fixed cell ranges once; this is safe if the first
+                # request reached Sheets but its response was interrupted.
+                try:
+                    time.sleep(0.25)
+                    self.sheet.batch_update(updates, value_input_option="RAW")
+                    self.events.put(("logged", (len(batch_values), last_cell)))
                 except Exception:
                     self.events.put(("log_error", None))
-            time.sleep(POLL_INTERVAL_SECONDS)
 
     def exit_app(self):
         if self.exiting:
